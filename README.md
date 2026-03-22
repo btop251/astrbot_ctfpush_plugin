@@ -23,7 +23,7 @@
 2. 将本项目克隆至 AstrBot 的 `data/plugins/` 目录下：
    ```bash
    cd data/plugins/
-   git clone https://github.com/YourName/astrbot_ctfpusher_plugin.git
+   git clone https://github.com/btop251/astrbot_ctfpush_plugin.git
 ```
 
 ## 📚 指令手册
