@@ -10,7 +10,6 @@ import asyncio
 import re
 import random
 import aiohttp
-import json
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -28,7 +27,6 @@ from ctf_plugin.db.sqlite import SQLiteManager
 from ctf_plugin.db.repository import CTFRepository
 from ctf_plugin.services.subscription import SubscriptionService
 from ctf_plugin.utils import (
-    build_event_text,
     extract_command_arg,
     extract_sender,
     match_tag,
@@ -40,6 +38,9 @@ from ctf_plugin.utils import (
 @register("ctf_pusher", "YourName", "CTFTime 赛事检索与订阅提醒插件", "3.2.0")
 class CTFPusherPlugin(Star):
     """路由层：仅负责指令接收、业务编排与响应拼装。"""
+
+    NSSCTF_BASE_URL = "https://www.nssctf.cn"
+    NSSCTF_PROBLEM_DETAIL_API = NSSCTF_BASE_URL + "/api/problem/v2/{pid}/"
 
     def __init__(self, context: Context):
         super().__init__(context)
@@ -162,16 +163,28 @@ class CTFPusherPlugin(Star):
         # 3. 终极兜底方案，使用本类内置的方法
         if not tag:
             tag = self._fallback_extract_command_arg(event, "ctf").strip()
-            
-        # 提示用户
-        hint = f"「{tag}」" if tag else ""
-        yield event.plain_result(f"🔍 正在从 NSSCTF 题库中挖掘{hint}题目，请稍候...")
-        
-        problem = await self.fetch_nssctf_problem(tag)
-        
-        if not problem:
-            yield event.plain_result("😵‍💫 糟糕，题目捞取失败！可能是 NSSCTF 接口波动或没有找到该类型的题目。")
-            return
+
+        # 仅推送“活题”：通过详情接口返回 code/data 判活。
+        # 若命中死题或标签不匹配，则继续捞取直到命中为止。
+        problem = None
+        while True:
+            candidate = await self.fetch_nssctf_problem(tag)
+            if not candidate:
+                await asyncio.sleep(0.2)
+                continue
+
+            alive, merged = await self._verify_and_enrich_nssctf_problem(candidate)
+            if not alive:
+                await asyncio.sleep(0.2)
+                continue
+
+            # 用户指定方向时，要求真实题目标签匹配。
+            if tag and not self._is_problem_tag_match(merged, tag):
+                await asyncio.sleep(0.2)
+                continue
+
+            problem = merged
+            break
             
         msg = self.build_nssctf_msg(problem)
         yield event.plain_result(msg)
@@ -221,31 +234,180 @@ class CTFPusherPlugin(Star):
                 "difficulty": random.choice(["入门", "简单", "中等", "困难", "噩梦"]),
                 "score": random.randint(100, 500),
                 "solved": random.randint(5, 200),
-                "link": f"https://www.nssctf.cn/problem/{random.randint(1000, 9999)}"
+                "link": f"https://www.nssctf.cn/problem/{random.randint(1000, 9999)}",
+                "description": random.choice(
+                    [
+                        "给定登录接口，请分析参数可控点并绕过鉴权。",
+                        "从混淆脚本中还原关键逻辑并拿到 flag。",
+                        "附件含流量包，请定位异常协议字段并复原密文。",
+                    ]
+                ),
             }
                 
         except Exception as e:
             logger.error(f"[NSSCTF] Error fetching problem: {e}")
             return None
 
+    @staticmethod
+    def _extract_problem_id(problem: dict) -> str:
+        """从题目对象中提取 pid，兼容多种字段。"""
+        for key in ("pid", "id", "problem_id"):
+            value = str(problem.get(key, "") or "").strip()
+            if value.isdigit():
+                return value
+
+        link = str(problem.get("link", "") or "")
+        m = re.search(r"/problem/(\d+)", link)
+        if m:
+            return m.group(1)
+
+        return ""
+
+    @staticmethod
+    def _extract_nssctf_description(problem: dict) -> str:
+        """兼容不同字段名提取题目描述。"""
+        for key in ("description", "desc", "content", "problem_description"):
+            value = str(problem.get(key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    async def _verify_and_enrich_nssctf_problem(self, problem: dict) -> tuple[bool, dict]:
+        """
+        通过 /api/problem/v2/{pid}/ 判活并回填详情。
+
+        判活规则：HTTP 200 且 JSON 中 code == 200 且 data 非空对象。
+        """
+        pid = self._extract_problem_id(problem)
+        if not pid:
+            return False, problem
+
+        api_url = self.NSSCTF_PROBLEM_DETAIL_API.format(pid=pid)
+        headers = {
+            "User-Agent": "AstrBot/CTFPlugin",
+            "Accept": "application/json",
+            "Referer": self.NSSCTF_BASE_URL,
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(api_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return False, problem
+                    payload = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"[NSSCTF] verify failed pid={pid}: {e}")
+            return False, problem
+
+        code = int(payload.get("code", -1)) if isinstance(payload, dict) else -1
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if code != 200 or not isinstance(data, dict) or not data:
+            return False, problem
+
+        merged = dict(problem)
+        merged["pid"] = data.get("pid", pid)
+        merged["title"] = data.get("title") or merged.get("title")
+        merged["score"] = data.get("point", merged.get("score"))
+        merged["difficulty"] = data.get("level", merged.get("difficulty"))
+
+        primary_tag = self._infer_primary_tag(data)
+        merged["tag"] = primary_tag if primary_tag else merged.get("tag", "General")
+
+        # 保存完整标签列表，供用户 tag 过滤匹配。
+        raw_tags = data.get("tag", [])
+        detail_tags: list[str] = []
+        if isinstance(raw_tags, list):
+            for item in raw_tags:
+                if isinstance(item, (list, tuple)) and item:
+                    detail_tags.append(str(item[0]))
+                elif isinstance(item, str):
+                    detail_tags.append(item)
+        merged["tags"] = detail_tags
+
+        merged["link"] = f"{self.NSSCTF_BASE_URL}/problem/{merged.get('pid', pid)}"
+
+        # 详情接口返回 desc 时优先使用；为空则给出可读占位，避免空文案。
+        desc = str(data.get("desc", "") or "").strip()
+        if not desc:
+            desc = "题目详情可访问（该题暂无公开描述）"
+        merged["description"] = desc
+
+        return True, merged
+
+    @staticmethod
+    def _infer_primary_tag(detail_data: dict) -> str:
+        tags = detail_data.get("tag", [])
+        if isinstance(tags, list) and tags:
+            first = tags[0]
+            if isinstance(first, (list, tuple)) and first:
+                return str(first[0])
+            if isinstance(first, str):
+                return first
+        return "General"
+
+    @staticmethod
+    def _extract_problem_tags(problem: dict) -> list[str]:
+        """统一提取题目标签为小写列表。"""
+        tags_out: list[str] = []
+
+        raw_tags = problem.get("tags")
+        if isinstance(raw_tags, list):
+            for item in raw_tags:
+                text = str(item).strip().lower()
+                if text:
+                    tags_out.append(text)
+
+        primary = str(problem.get("tag", "") or "").strip().lower()
+        if primary:
+            tags_out.append(primary)
+
+        # 去重并保序
+        unique: list[str] = []
+        for t in tags_out:
+            if t not in unique:
+                unique.append(t)
+        return unique
+
+    def _is_problem_tag_match(self, problem: dict, user_tag: str) -> bool:
+        user = str(user_tag or "").strip().lower()
+        if not user:
+            return True
+
+        tags = self._extract_problem_tags(problem)
+        if not tags:
+            return False
+
+        for t in tags:
+            if user in t or t in user:
+                return True
+        return False
+
     def build_nssctf_msg(self, problem: dict) -> str:
         """构建 NSSCTF 题目展示消息"""
+        pid = problem.get("pid", problem.get("id", "N/A"))
         title = problem.get("title", "未知题目")
         tag = problem.get("tag", "General")
         difficulty = problem.get("difficulty", "未知")
         link = problem.get("link", "https://www.nssctf.cn/problem_list")
+        description = self._extract_nssctf_description(problem)
         
         # 尝试获取分数或解出人数
         score_info = f"{difficulty}" 
         if "score" in problem:
             score_info += f" ({problem['score']} pts)"
+
+        if len(description) > 120:
+            description = description[:117] + "..."
             
         return (
             "🎯 【NSSCTF 随机跳题】\n"
             "━━━━━━━━━━━━━━\n"
+            f"🆔 题号: {pid}\n"
             f"🏷️ 方向: {tag}\n"
             f"📌 题目: {title}\n"
             f"🌟 难度: {score_info}\n"
+            f"📝 描述: {description or '暂无描述'}\n"
             f"🔗 链接: {link}\n"
             "━━━━━━━━━━━━━━\n"
             "💡 快去开启动态靶机尝试拿下 flag 吧！"
@@ -259,7 +421,6 @@ class CTFPusherPlugin(Star):
     async def cmd_ctftime(self, event: AstrMessageEvent):
         """精准定向查询：/ctftime"""
         subscriber = extract_sender(event)
-        yield event.plain_result("🌐 正在拉取 CTFTime 高质量国际赛事...")
         events = await self.query_service.fetch_ctftime_only(days_ahead=14)
 
         if not events:
@@ -269,12 +430,20 @@ class CTFPusherPlugin(Star):
         events = sorted(events, key=lambda x: str(x.get("start_time", "")))
         self._save_last_query_events(subscriber, events, limit=6)
 
-        yield event.plain_result(f"🌐 CTFTime 命中 {len(events)} 场，展示前 6 场（可用 /ctf订阅 序号 订阅）：")
-        for idx, item in enumerate(events[:6], 1):
-            msg = f"【序号 {idx}】\n" + build_event_text(item) + f"\n📊 Weight: {item.get('weight', 0)}"
-            yield event.plain_result(msg)
-            if idx < min(5, len(events) - 1):
-                await asyncio.sleep(0.6)
+        shown = events[:6]
+        lines = [
+            f"🌐 CTFTime 命中 {len(events)} 场，展示前 {len(shown)} 场（可用 /ctf订阅 序号 订阅）"
+        ]
+        for idx, item in enumerate(shown, 1):
+            tags = ", ".join(item.get("tags", [])[:3]) or "无"
+            lines.append(
+                f"{idx}. {item.get('title', '未知赛事')}\n"
+                f"ID: {item.get('id', 'N/A')} | 开赛(UTC+8): {to_bj_text(str(item.get('start_time', '')))} | Weight: {item.get('weight', 0)}\n"
+                f"标签: {tags}\n"
+                f"链接: {item.get('url', '')}"
+            )
+
+        yield event.plain_result("\n\n".join(lines))
 
     # -----------------------------------------------------------
     # 订阅管理指令 (逻辑保持不变)
